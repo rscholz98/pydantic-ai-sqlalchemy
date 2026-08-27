@@ -3,10 +3,13 @@
 Implemented by work unit U7. Signatures are frozen; see ``_store.SQLAlchemyChatStore``.
 
 Implementation contract:
-- ``purge_older_than`` keys off ``last_activity_at``; count affected rows per table first
-  (that is the ``dry_run`` report), then delete rows child-first (tool calls, runs,
-  messages, conversations). Children are deleted explicitly rather than via FK CASCADE
-  because SQLite hosts often run without the ``foreign_keys`` pragma.
+- ``purge_older_than`` keys off ``last_activity_at``. A ``dry_run`` counts affected rows per
+  table without deleting; a real purge deletes child-first and reports the exact rowcounts of
+  the delete statements themselves.
+- Children are deleted explicitly rather than via FK CASCADE because SQLite hosts often run
+  without the ``foreign_keys`` pragma. For the same reason the self-referencing
+  ``message.parent_id`` SET NULL semantics only apply on SQLite when the pragma is enabled;
+  retention is unaffected because all messages of a conversation are deleted together.
 - ``delete_conversation`` returns the number of deleted message rows; raise
   ``ConversationNotFoundError`` for unknown keys.
 """
@@ -40,12 +43,10 @@ async def delete_conversation(
     matching_ids = sa.select(conversation.id).where(conversation.conversation_key == conversation_key)
 
     async with store.sessions.scope(session) as (db, _owned):
-        exists = await db.scalar(matching_ids)
-        if exists is None:
+        report = await _delete_matching(db, store, matching_ids)
+        if report.conversations == 0:
             raise ConversationNotFoundError(f'conversation with key {conversation_key!r} does not exist')
-        deleted_messages = await _delete_matching(db, store, matching_ids)
-        await db.flush()
-        return deleted_messages
+        return report.messages
 
 
 async def purge_older_than(
@@ -64,18 +65,15 @@ async def purge_older_than(
     )
 
     async with store.sessions.scope(session) as (db, _owned):
-        report = PurgeReport(
-            conversations=await _count(db, conversation, conversation.id.in_(matching_ids)),
-            messages=await _count(db, message, message.conversation_pk.in_(matching_ids)),
-            runs=await _count(db, run, run.conversation_pk.in_(matching_ids)),
-            tool_calls=await _count(db, tool_call, tool_call.conversation_pk.in_(matching_ids)),
-            dry_run=dry_run,
-        )
         if dry_run:
-            return report
-        await _delete_matching(db, store, matching_ids)
-        await db.flush()
-        return report
+            return PurgeReport(
+                conversations=await _count(db, conversation, conversation.id.in_(matching_ids)),
+                messages=await _count(db, message, message.conversation_pk.in_(matching_ids)),
+                runs=await _count(db, run, run.conversation_pk.in_(matching_ids)),
+                tool_calls=await _count(db, tool_call, tool_call.conversation_pk.in_(matching_ids)),
+                dry_run=True,
+            )
+        return await _delete_matching(db, store, matching_ids)
 
 
 async def _count(db: AsyncSession, entity: type[object], criterion: sa.ColumnElement[bool]) -> int:
@@ -85,30 +83,33 @@ async def _count(db: AsyncSession, entity: type[object], criterion: sa.ColumnEle
 
 async def _delete_matching(
     db: AsyncSession, store: SQLAlchemyChatStore, matching_ids: sa.Select[tuple[uuid.UUID]]
-) -> int:
-    """Delete all rows of the matching conversations child-first; return the deleted message count."""
+) -> PurgeReport:
+    """Delete all rows of the matching conversations child-first; report the deleted rowcounts.
+
+    Only the four store tables are covered: hosts that add their own FK-linked tables onto the
+    store schema must delete those rows themselves before calling retention.
+    """
     conversation = store.models.conversation
     message = store.models.message
     run = store.models.run
     tool_call = store.models.tool_call
 
-    await db.execute(
-        sa.delete(tool_call)
-        .where(tool_call.conversation_pk.in_(matching_ids))
-        .execution_options(synchronize_session=False)
+    tool_calls_deleted = await _delete_rows(db, tool_call, tool_call.conversation_pk.in_(matching_ids))
+    runs_deleted = await _delete_rows(db, run, run.conversation_pk.in_(matching_ids))
+    messages_deleted = await _delete_rows(db, message, message.conversation_pk.in_(matching_ids))
+    conversations_deleted = await _delete_rows(db, conversation, conversation.id.in_(matching_ids))
+    return PurgeReport(
+        conversations=conversations_deleted,
+        messages=messages_deleted,
+        runs=runs_deleted,
+        tool_calls=tool_calls_deleted,
+        dry_run=False,
     )
-    await db.execute(
-        sa.delete(run).where(run.conversation_pk.in_(matching_ids)).execution_options(synchronize_session=False)
-    )
-    message_result = cast(
+
+
+async def _delete_rows(db: AsyncSession, entity: type[object], criterion: sa.ColumnElement[bool]) -> int:
+    result = cast(
         'CursorResult[Any]',
-        await db.execute(
-            sa.delete(message)
-            .where(message.conversation_pk.in_(matching_ids))
-            .execution_options(synchronize_session=False)
-        ),
+        await db.execute(sa.delete(entity).where(criterion).execution_options(synchronize_session=False)),
     )
-    await db.execute(
-        sa.delete(conversation).where(conversation.id.in_(matching_ids)).execution_options(synchronize_session=False)
-    )
-    return message_result.rowcount
+    return result.rowcount
