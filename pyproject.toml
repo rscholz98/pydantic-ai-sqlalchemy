@@ -35,7 +35,7 @@ Repository = 'https://github.com/rscholz98/pydantic-ai-sqlalchemy'
 postgres = ['asyncpg>=0.29']
 sqlite = ['aiosqlite>=0.20']
 # pydantic-ai-harness needs pydantic-ai-slim>=2.33; hosts pinned below that can only use the core store.
-harness = ['pydantic-ai-harness>=0.26']
+harness = ['pydantic-ai-harness>=0.26', 'pydantic-ai-slim>=2.33']
 
 [dependency-groups]
 dev = [
