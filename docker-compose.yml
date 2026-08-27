@@ -1,0 +1,26 @@
+# Local PostgreSQL for the dialect test suite.
+#
+# Usage:
+#   docker compose up -d --wait postgres
+#   export PAI_SQLA_TEST_PG_DSN=postgresql+asyncpg://postgres:postgres@localhost:5432/pai_test
+#   uv run --extra postgres pytest
+#
+# The --wait flag blocks until the healthcheck below passes, and the postgres extra
+# installs asyncpg (it is an optional dependency, not part of the dev group).
+#
+# With the DSN exported, the parametrized `engine` fixture runs every store test
+# against PostgreSQL in addition to SQLite; without it, only SQLite runs.
+services:
+  postgres:
+    image: postgres:16
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pai_test
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d pai_test']
+      interval: 5s
+      timeout: 3s
+      retries: 10
