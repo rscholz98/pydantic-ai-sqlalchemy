@@ -1,0 +1,86 @@
+[build-system]
+requires = ['hatchling']
+build-backend = 'hatchling.build'
+
+[project]
+name = 'pydantic-ai-sqlalchemy'
+version = '0.1.0'
+description = 'Async SQLAlchemy storage adapter for Pydantic AI: archive chats, runs, usage and tool calls for analytics'
+readme = 'README.md'
+license = 'MIT'
+authors = [{ name = 'Richard Scholz' }]
+requires-python = '>=3.10'
+classifiers = [
+    'Development Status :: 4 - Beta',
+    'Intended Audience :: Developers',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Programming Language :: Python :: 3.14',
+    'Topic :: Database',
+    'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    'Typing :: Typed',
+]
+dependencies = [
+    # 2.31 is the floor because ModelResponse.state / RequestUsage.cost are read by the denorm extractor.
+    'pydantic-ai-slim>=2.31',
+    'sqlalchemy[asyncio]>=2.0.30',
+]
+
+[project.urls]
+Repository = 'https://github.com/rscholz98/pydantic-ai-sqlalchemy'
+
+[project.optional-dependencies]
+postgres = ['asyncpg>=0.29']
+sqlite = ['aiosqlite>=0.20']
+# pydantic-ai-harness needs pydantic-ai-slim>=2.33; hosts pinned below that can only use the core store.
+harness = ['pydantic-ai-harness>=0.26']
+
+[dependency-groups]
+dev = [
+    'aiosqlite>=0.20',
+    'coverage[toml]>=7.6',
+    'hypothesis>=6.100',
+    'pydantic-ai-harness>=0.26',
+    'pyright>=1.1.390',
+    'pytest>=8.3',
+    'pytest-asyncio>=0.24',
+    'ruff>=0.9',
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ['src/pydantic_ai_sqlalchemy']
+
+[tool.ruff]
+line-length = 120
+target-version = 'py310'
+include = ['src/**/*.py', 'tests/**/*.py', 'examples/**/*.py']
+
+[tool.ruff.lint]
+extend-select = ['Q', 'I', 'UP', 'B']
+flake8-quotes = { inline-quotes = 'single', multiline-quotes = 'double' }
+
+[tool.ruff.format]
+quote-style = 'single'
+
+[tool.pyright]
+include = ['src', 'tests']
+strict = ['src']
+pythonVersion = '3.10'
+venvPath = '.'
+venv = '.venv'
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
+asyncio_mode = 'auto'
+asyncio_default_fixture_loop_scope = 'function'
+xfail_strict = true
+
+[tool.coverage.run]
+source = ['src/pydantic_ai_sqlalchemy']
+branch = true
+
+[tool.coverage.report]
+skip_covered = true
+show_missing = true
