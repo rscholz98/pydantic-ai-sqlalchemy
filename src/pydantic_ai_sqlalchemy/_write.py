@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 from pydantic_ai.messages import ModelMessage
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -209,25 +211,69 @@ async def _get_or_create_conversation(
     conversation_id: str | None,
 ) -> BaseConversation:
     conversation_cls = store.models.conversation
-    conversation = await db.scalar(
-        sa.select(conversation_cls).where(conversation_cls.conversation_key == conversation_key)
-    )
+    conversation = await _select_conversation(db, conversation_cls, conversation_key)
     if conversation is None:
-        conversation = conversation_cls()
-        conversation.conversation_key = conversation_key
-        conversation.message_count = 0
-        conversation.total_input_tokens = 0
-        conversation.total_output_tokens = 0
-        now = _utcnow()
-        conversation.created_at = now
-        conversation.updated_at = now
-        if conversation_id is not None:
-            conversation.conversation_id = conversation_id
-        db.add(conversation)
-        await db.flush()
-    elif conversation_id is not None and conversation.conversation_id != conversation_id:
+        await _insert_conversation_if_absent(
+            db, conversation_cls, conversation_key=conversation_key, conversation_id=conversation_id
+        )
+        # Concurrent creators race on the unique conversation_key; whoever lost adopts the
+        # winner's row here (our own insert is equally visible to this re-select).
+        conversation = await _select_conversation(db, conversation_cls, conversation_key)
+        if conversation is None:
+            raise StoreError(f'conversation {conversation_key!r} could not be created')
+    if conversation_id is not None and conversation.conversation_id != conversation_id:
         conversation.conversation_id = conversation_id
     return conversation
+
+
+async def _select_conversation(
+    db: AsyncSession, conversation_cls: type[BaseConversation], conversation_key: str
+) -> BaseConversation | None:
+    return await db.scalar(sa.select(conversation_cls).where(conversation_cls.conversation_key == conversation_key))
+
+
+async def _insert_conversation_if_absent(
+    db: AsyncSession,
+    conversation_cls: type[BaseConversation],
+    *,
+    conversation_key: str,
+    conversation_id: str | None,
+) -> None:
+    """Insert a conversation row, tolerating a concurrent creator winning the key race.
+
+    On SQLite and PostgreSQL this uses native ``INSERT ... ON CONFLICT DO NOTHING``: on a
+    lost race PostgreSQL waits for the winner, skips the insert and leaves the transaction
+    healthy. Elsewhere the insert runs inside a savepoint so the ``IntegrityError`` of a
+    lost race cannot poison a caller-owned outer transaction. (A savepoint is not used on
+    SQLite on purpose: with the driver's default legacy transaction handling a SAVEPOINT
+    emitted before any DML would open and autocommit its own transaction.)
+    """
+    now = _utcnow()
+    values: dict[str, object] = {
+        'id': uuid.uuid4(),
+        'conversation_key': conversation_key,
+        'conversation_id': conversation_id,
+        'created_at': now,
+        'updated_at': now,
+        'message_count': 0,
+        'total_input_tokens': 0,
+        'total_output_tokens': 0,
+    }
+    dialect_name = db.get_bind().dialect.name
+    if dialect_name == 'postgresql':
+        await db.execute(
+            pg_insert(conversation_cls).values(**values).on_conflict_do_nothing(index_elements=['conversation_key'])
+        )
+    elif dialect_name == 'sqlite':
+        await db.execute(
+            sqlite_insert(conversation_cls).values(**values).on_conflict_do_nothing(index_elements=['conversation_key'])
+        )
+    else:
+        try:
+            async with db.begin_nested():
+                await db.execute(sa.insert(conversation_cls).values(**values))
+        except IntegrityError:
+            pass
 
 
 async def _count_persisted_prefix(
