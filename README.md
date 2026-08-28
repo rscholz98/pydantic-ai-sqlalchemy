@@ -182,6 +182,8 @@ setups need: open the session, arm your RLS session variables (tenant id and fri
 session to the store, commit yourself.
 
 ```python
+from sqlalchemy import text
+
 async with app_sessionmaker() as session:
     await session.execute(text("SELECT set_config('app.current_tenant', :t, true)"), {'t': tenant_id})
     await store.save_run(result, conversation_key=key, session=session)
@@ -223,7 +225,7 @@ class AppBase(DeclarativeBase):  # your application's existing declarative base
 # for example from an RLS session variable:
 def tenant_column() -> Mapped[str]:
     return mapped_column(
-        sa.String(64), nullable=False, index=True, server_default=sa.text("current_setting('app.current_tenant')")
+        sa.String(64), nullable=False, index=True, server_default=sa.text("current_setting('app.current_tenant', true)")
     )
 
 
