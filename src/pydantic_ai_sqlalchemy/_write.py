@@ -3,11 +3,16 @@
 Implemented by work unit U2. Signatures are frozen; see ``_store.SQLAlchemyChatStore``.
 
 Implementation contract:
+- Writers serialize on a ``SELECT ... FOR UPDATE`` row lock of the conversation row taken
+  before reading ``max(seq)``: concurrent PostgreSQL writers queue on the lock and each
+  sees the previous writer's committed rows once it acquires it (SQLite compiles FOR
+  UPDATE to a no-op and serializes writes anyway). With a caller-provided session the
+  lock is held until the caller commits.
 - Allocate ``seq`` as ``max(seq) + 1`` inside the transaction; insert the batch inside a
-  SAVEPOINT (``session.begin_nested()``) and retry (up to 5 times, small jitter) on
-  ``IntegrityError`` from the ``(conversation_pk, seq)`` unique constraint, so a
-  caller-owned outer transaction survives collisions. Raise ``SequenceAllocationError``
-  after the last retry.
+  SAVEPOINT (``session.begin_nested()``) and, as a defensive fallback behind the row
+  lock, retry with a small jitter on ``IntegrityError`` from the
+  ``(conversation_pk, seq)`` unique constraint, so a caller-owned outer transaction
+  survives collisions. Raise ``SequenceAllocationError`` after the last retry.
 - Idempotency: before inserting a batch with a ``run_id``, load existing content hashes for
   ``(conversation_pk, run_id)`` and skip the already-persisted multiset prefix.
 - Maintain conversation rollups (message_count, first/last activity, token/cost totals) and
@@ -48,7 +53,7 @@ if TYPE_CHECKING:
 
 __all__ = ['get_or_create_conversation', 'save_messages', 'save_run']
 
-_MAX_SEQ_ATTEMPTS = 5
+_MAX_SEQ_ATTEMPTS = 10
 _MAX_RETRY_JITTER_SECONDS = 0.05
 #: Model names stamped onto synthetic responses (e.g. by ``save_partial_run``); their zero
 #: usage must not pollute token/cost rollups.
@@ -150,6 +155,14 @@ async def _save_batch(
             store, db, conversation_key=conversation_key, conversation_id=conversation_id
         )
         conversation_pk = conversation.id
+
+        # Serialize sequence allocation on the conversation row: concurrent PostgreSQL
+        # writers queue on this lock (held until the transaction commits, so with a
+        # caller-provided session until the caller commits) and each sees the previous
+        # writer's committed seqs; SQLite compiles FOR UPDATE to a no-op and serializes
+        # writes on its own single-writer lock anyway.
+        conversation_cls = store.models.conversation
+        await db.execute(sa.select(conversation_cls.id).where(conversation_cls.id == conversation_pk).with_for_update())
 
         skipped = 0
         if run_id is not None:
@@ -322,7 +335,9 @@ async def _insert_batch_with_retry(
 ) -> list[BaseMessage]:
     """Insert the batch at ``max(seq) + 1`` inside a savepoint, retrying on seq collisions.
 
-    The savepoint keeps a caller-owned outer transaction alive when a concurrent writer wins
+    Writers are already serialized by the conversation row lock taken in ``_save_batch``,
+    so this retry loop is a defensive fallback (e.g. for dialects without row locks). The
+    savepoint keeps a caller-owned outer transaction alive when a concurrent writer wins
     the ``(conversation_pk, seq)`` unique constraint; each retry re-reads ``max(seq)``.
     """
     last_error: IntegrityError | None = None
