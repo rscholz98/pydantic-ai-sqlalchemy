@@ -93,7 +93,7 @@ def _tool_call(
 
 @pytest.fixture
 async def seeded(engine: AsyncEngine, store: SQLAlchemyChatStore) -> SQLAlchemyChatStore:
-    """Two conversations across three days, four runs, five extracted tool calls.
+    """Two conversations across three days, five runs, five extracted tool calls.
 
     conv-a: request+response on day 1, request + three responses on day 2 (one of them the
     synthetic 'interrupted' marker), one response with a NULL timestamp, a request on day 3.
@@ -281,6 +281,14 @@ async def seeded(engine: AsyncEngine, store: SQLAlchemyChatStore) -> SQLAlchemyC
                     state='running',
                     started_at=datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
                 ),
+                DefaultRun(
+                    run_id='run-5',
+                    conversation_pk=conv_b.id,
+                    state='error',
+                    started_at=None,
+                    input_tokens=10,
+                    output_tokens=5,
+                ),
             ]
         )
         await session.commit()
@@ -368,6 +376,17 @@ async def test_usage_by_model_boundaries(seeded: SQLAlchemyChatStore) -> None:
     ]
     assert await seeded.usage_by_model(since=MSG_A2_TS, until=MSG_A2_TS) == []
 
+    # The NULL-timestamp response is counted unbounded (4 gpt-5 requests) but drops out of any window.
+    bounded = await seeded.usage_by_model(since=D1)
+    assert bounded[0] == ModelUsage(
+        model_name='gpt-5',
+        provider_name='openai',
+        model_requests=3,
+        input_tokens=350,
+        output_tokens=155,
+        cost=Decimal('0.0037'),
+    )
+
 
 async def test_usage_by_conversation(seeded: SQLAlchemyChatStore) -> None:
     result = await seeded.usage_by_conversation()
@@ -429,8 +448,9 @@ async def test_run_stats(seeded: SQLAlchemyChatStore) -> None:
         output_tokens=250,
         cost=Decimal('0.003'),
     )
+    # run-5 has a NULL started_at: included in the unbounded call, its NULL duration ignored by AVG.
     assert by_state['error'] == RunStats(
-        state='error', run_count=1, avg_duration_ms=300.0, input_tokens=50, output_tokens=25, cost=Decimal('0.0007')
+        state='error', run_count=2, avg_duration_ms=300.0, input_tokens=60, output_tokens=30, cost=Decimal('0.0007')
     )
     assert by_state['running'] == RunStats(
         state='running', run_count=1, avg_duration_ms=None, input_tokens=0, output_tokens=0, cost=None
@@ -446,6 +466,10 @@ async def test_run_stats(seeded: SQLAlchemyChatStore) -> None:
         output_tokens=200,
         cost=Decimal('0.002'),
     )
+    # The NULL started_at run is excluded as soon as a time bound is passed.
+    assert since_d2['error'] == RunStats(
+        state='error', run_count=1, avg_duration_ms=300.0, input_tokens=50, output_tokens=25, cost=Decimal('0.0007')
+    )
     assert len(since_d2) == 3
 
 
@@ -456,14 +480,14 @@ async def test_tool_usage_grouped(seeded: SQLAlchemyChatStore) -> None:
         ToolUsage(tool_name='calculator', call_count=1, returned_count=0, error_count=0, unanswered_count=1),
     ]
 
-    since_d2 = {row.tool_name: row for row in await seeded.tool_usage(since=D2)}
-    assert since_d2['search'] == ToolUsage(
-        tool_name='search', call_count=3, returned_count=1, error_count=1, unanswered_count=0
-    )
-    # NULL called_at rows stay in range regardless of since.
-    assert since_d2['calculator'] == ToolUsage(
-        tool_name='calculator', call_count=1, returned_count=0, error_count=0, unanswered_count=1
-    )
+    # NULL called_at rows (calculator) are excluded as soon as a time bound is passed.
+    since_d2 = await seeded.tool_usage(since=D2)
+    assert since_d2 == [
+        ToolUsage(tool_name='search', call_count=3, returned_count=1, error_count=1, unanswered_count=0)
+    ]
+
+    # A populated tool_call table with an empty window returns [] and never falls back.
+    assert await seeded.tool_usage(since=datetime(2026, 8, 27, tzinfo=UTC)) == []
 
 
 async def test_tool_usage_fallback(engine: AsyncEngine, store: SQLAlchemyChatStore) -> None:

@@ -7,6 +7,15 @@ Implementation contract:
 - Filter synthetic rows (``model_name`` in ('interrupted', 'error')) out of token/cost sums.
 - Group by calendar day with ``sa.func.date(...)`` so SQLite and PostgreSQL both work.
 - Return raw numbers; no thresholds or judgments baked in.
+
+NULL-timestamp semantics: as soon as a time bound (``since``/``until``) is passed, rows whose
+timestamp column is NULL are excluded explicitly from that query; unbounded calls include them.
+This applies to ``message_timestamp``, ``run.started_at`` and ``tool_call.called_at`` alike.
+``usage_by_day`` and ``cost_report(group_by='day')`` always exclude NULL timestamps because
+such rows belong to no calendar day.
+
+Day bucketing is the UTC calendar day: on PostgreSQL ``date(timestamptz)`` depends on the
+session timezone, so the timestamp is converted with ``timezone('UTC', ...)`` first.
 """
 
 from __future__ import annotations
@@ -81,13 +90,27 @@ def _time_bounds(
     since: datetime | None,
     until: datetime | None,
 ) -> list[sa.ColumnElement[bool]]:
-    """``since`` is inclusive, ``until`` exclusive; missing bounds add no filter."""
+    """``since`` is inclusive, ``until`` exclusive; any bound explicitly excludes NULL timestamps."""
     bounds: list[sa.ColumnElement[bool]] = []
+    if since is None and until is None:
+        return bounds
+    bounds.append(column.is_not(None))
     if since is not None:
         bounds.append(column >= since)
     if until is not None:
         bounds.append(column < until)
     return bounds
+
+
+def _day_expression(message: type[BaseMessage], dialect_name: str) -> sa.ColumnElement[date]:
+    """UTC calendar day of ``message_timestamp``.
+
+    On PostgreSQL ``date(timestamptz)`` depends on the session timezone, so the timestamp is
+    converted to UTC first; SQLite stores UTC strings and ``date(...)`` reads them as-is.
+    """
+    if dialect_name == 'postgresql':
+        return sa.cast(sa.func.timezone('UTC', message.message_timestamp), sa.Date())
+    return sa.func.date(message.message_timestamp)
 
 
 async def usage_by_day(
@@ -99,21 +122,21 @@ async def usage_by_day(
 ) -> list[DailyUsage]:
     message = store.models.message
     qualifies = _qualifying_response(message)
-    day = sa.func.date(message.message_timestamp)
-    statement = (
-        sa.select(
-            day.label('day'),
-            sa.func.count(sa.case((qualifies, 1))).label('model_requests'),
-            sa.func.sum(sa.case((qualifies, message.input_tokens))).label('input_tokens'),
-            sa.func.sum(sa.case((qualifies, message.output_tokens))).label('output_tokens'),
-            sa.func.sum(sa.case((qualifies, message.cache_read_tokens))).label('cache_read_tokens'),
-            sa.func.sum(sa.case((qualifies, message.cost))).label('cost'),
-            sa.func.count(sa.distinct(message.conversation_pk)).label('active_conversations'),
-        )
-        .where(message.message_timestamp.is_not(None), *_time_bounds(message.message_timestamp, since, until))
-        .group_by(day)
-    )
     async with store.sessions.scope(session) as (db, _owned):
+        day = _day_expression(message, db.get_bind().dialect.name)
+        statement = (
+            sa.select(
+                day.label('day'),
+                sa.func.count(sa.case((qualifies, 1))).label('model_requests'),
+                sa.func.sum(sa.case((qualifies, message.input_tokens))).label('input_tokens'),
+                sa.func.sum(sa.case((qualifies, message.output_tokens))).label('output_tokens'),
+                sa.func.sum(sa.case((qualifies, message.cache_read_tokens))).label('cache_read_tokens'),
+                sa.func.sum(sa.case((qualifies, message.cost))).label('cost'),
+                sa.func.count(sa.distinct(message.conversation_pk)).label('active_conversations'),
+            )
+            .where(message.message_timestamp.is_not(None), *_time_bounds(message.message_timestamp, since, until))
+            .group_by(day)
+        )
         rows = (await db.execute(statement)).all()
     daily = [
         DailyUsage(
@@ -236,8 +259,9 @@ async def run_stats(
         sa.func.sum(run.output_tokens).label('output_tokens'),
         sa.func.sum(run.cost).label('cost'),
     ).group_by(run.state)
-    if since is not None:
-        statement = statement.where(run.started_at >= since)
+    bounds = _time_bounds(run.started_at, since, None)
+    if bounds:
+        statement = statement.where(*bounds)
     async with store.sessions.scope(session) as (db, _owned):
         rows = (await db.execute(statement)).all()
     stats = [
@@ -261,18 +285,25 @@ async def tool_usage(
     since: datetime | None = None,
     session: AsyncSession | None = None,
 ) -> list[ToolUsage]:
-    """Aggregate the tool_calls table; fall back to summing ``tool_call_count`` when extraction is off."""
+    """Aggregate the tool_calls table; fall back to summing ``tool_call_count`` when extraction is off.
+
+    The fallback fires only when the tool_call table is empty overall (extraction was never on);
+    a populated table whose rows all fall outside the window yields an empty list.
+    """
     message = store.models.message
     tool_call = store.models.tool_call
-    grouped = sa.select(
-        tool_call.tool_name,
-        sa.func.count().label('call_count'),
-        sa.func.count(sa.case((tool_call.status == 'returned', 1))).label('returned_count'),
-        sa.func.count(sa.case((tool_call.status == 'error', 1))).label('error_count'),
-        sa.func.count(sa.case((tool_call.status == 'unanswered', 1))).label('unanswered_count'),
-    ).group_by(tool_call.tool_name)
-    if since is not None:
-        grouped = grouped.where(sa.or_(tool_call.called_at >= since, tool_call.called_at.is_(None)))
+    bounds = _time_bounds(tool_call.called_at, since, None)
+    grouped = (
+        sa.select(
+            tool_call.tool_name,
+            sa.func.count().label('call_count'),
+            sa.func.count(sa.case((tool_call.status == 'returned', 1))).label('returned_count'),
+            sa.func.count(sa.case((tool_call.status == 'error', 1))).label('error_count'),
+            sa.func.count(sa.case((tool_call.status == 'unanswered', 1))).label('unanswered_count'),
+        )
+        .where(*bounds)
+        .group_by(tool_call.tool_name)
+    )
     async with store.sessions.scope(session) as (db, _owned):
         rows = (await db.execute(grouped)).all()
         if rows:
@@ -288,6 +319,9 @@ async def tool_usage(
             ]
             usage.sort(key=lambda item: (-item.call_count, item.tool_name))
             return usage
+        has_tool_calls = (await db.execute(sa.select(tool_call.id).limit(1))).first() is not None
+        if has_tool_calls:
+            return []
         fallback = sa.select(sa.func.sum(message.tool_call_count)).where(
             *_time_bounds(message.message_timestamp, since, None)
         )
@@ -311,29 +345,29 @@ async def cost_report(
         _qualifying_response(message),
         *_time_bounds(message.message_timestamp, since, until),
     ]
-    if group_by == 'day':
-        key = sa.func.date(message.message_timestamp).label('group_key')
-        conditions.append(message.message_timestamp.is_not(None))
-    elif group_by == 'model':
-        key = message.model_name.label('group_key')
-    else:
-        key = conversation.conversation_key.label('group_key')
-    statement = (
-        sa.select(
-            key,
-            sa.func.count().label('model_requests'),
-            sa.func.sum(message.input_tokens).label('input_tokens'),
-            sa.func.sum(message.output_tokens).label('output_tokens'),
-            sa.func.sum(message.cost).label('cost'),
-        )
-        .where(*conditions)
-        .group_by(key)
-    )
-    if group_by == 'conversation':
-        statement = statement.select_from(message).join(
-            conversation, onclause=message.conversation_pk == conversation.id
-        )
     async with store.sessions.scope(session) as (db, _owned):
+        if group_by == 'day':
+            key = _day_expression(message, db.get_bind().dialect.name).label('group_key')
+            conditions.append(message.message_timestamp.is_not(None))
+        elif group_by == 'model':
+            key = message.model_name.label('group_key')
+        else:
+            key = conversation.conversation_key.label('group_key')
+        statement = (
+            sa.select(
+                key,
+                sa.func.count().label('model_requests'),
+                sa.func.sum(message.input_tokens).label('input_tokens'),
+                sa.func.sum(message.output_tokens).label('output_tokens'),
+                sa.func.sum(message.cost).label('cost'),
+            )
+            .where(*conditions)
+            .group_by(key)
+        )
+        if group_by == 'conversation':
+            statement = statement.select_from(message).join(
+                conversation, onclause=message.conversation_pk == conversation.id
+            )
         rows = (await db.execute(statement)).all()
 
     def _group_label(value: object) -> str:
