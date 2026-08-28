@@ -11,6 +11,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from pydantic_ai_sqlalchemy import SQLAlchemyStepStore
+from pydantic_ai_sqlalchemy._step_models import StepEvent as StepEventRow
+from pydantic_ai_sqlalchemy._step_models import StepRun as StepRunRow
+from pydantic_ai_sqlalchemy._step_models import StepSnapshot as StepSnapshotRow
 from pydantic_ai_sqlalchemy._step_models import StepToolEffect
 
 from .message_fixtures import binary_user_request, sample_conversation, text_response, user_request
@@ -229,3 +232,47 @@ async def test_tool_effect_upsert_lifecycle(engine: AsyncEngine) -> None:
             .where(StepToolEffect.run_id == 'run-1', StepToolEffect.tool_call_id == 'call_1')
         )
     assert count == 1
+
+
+async def test_list_snapshots_order_and_gating(engine: AsyncEngine) -> None:
+    store = SQLAlchemyStepStore(engine)
+    assert await store.list_snapshots(run_id='run-1') == []
+
+    await store.save_snapshot(sp.ContinuableSnapshot(run_id='run-1', step_index=1, messages=[user_request()]))
+    await store.save_snapshot(
+        sp.ContinuableSnapshot(
+            run_id='run-1', step_index=2, messages=[user_request(), text_response()], state='interrupted'
+        )
+    )
+    await store.save_snapshot(sp.ContinuableSnapshot(run_id='run-1', step_index=3, messages=[user_request()]))
+    await store.save_snapshot(sp.ContinuableSnapshot(run_id='run-2', step_index=9, messages=[user_request()]))
+
+    complete_only = await store.list_snapshots(run_id='run-1')
+    assert [snapshot.step_index for snapshot in complete_only] == [1, 3]
+    assert all(snapshot.state == 'complete' for snapshot in complete_only)
+
+    everything = await store.list_snapshots(run_id='run-1', include_interrupted=True)
+    assert [snapshot.step_index for snapshot in everything] == [1, 2, 3]
+    assert [snapshot.state for snapshot in everything] == ['complete', 'interrupted', 'complete']
+
+
+async def test_read_validation_rejects_bad_stored_values(engine: AsyncEngine) -> None:
+    store = SQLAlchemyStepStore(engine)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        session.add(StepRunRow(run_id='bad-run', run_metadata={'count': 1}))
+        session.add(StepEventRow(run_id='bad-events', kind='not_a_kind', step_index=0, event_metadata={}))
+        session.add(StepToolEffect(run_id='bad-run', tool_call_id='call_1', tool_name='t', status='pending'))
+        session.add(StepSnapshotRow(run_id='bad-snap', step_index=0, state='weird', messages=[]))
+        await session.commit()
+
+    with pytest.raises(ValueError):
+        await store.get_run(run_id='bad-run')
+    with pytest.raises(ValueError):
+        await store.list_events(run_id='bad-events')
+    with pytest.raises(ValueError):
+        await store.get_tool_effect(run_id='bad-run', tool_call_id='call_1')
+    with pytest.raises(ValueError):
+        await store.latest_snapshot(run_id='bad-snap', include_interrupted=True)
+    with pytest.raises(ValueError):
+        await store.list_snapshots(run_id='bad-snap', include_interrupted=True)

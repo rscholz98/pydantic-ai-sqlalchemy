@@ -21,6 +21,7 @@ from __future__ import annotations
 from types import ModuleType
 from typing import TYPE_CHECKING, cast
 
+from pydantic import TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from ._base import Base
@@ -51,9 +52,21 @@ def _harness() -> ModuleType:
     return step_persistence
 
 
-def _str_metadata(payload: dict[str, object]) -> dict[str, str]:
-    """Coerce a stored JSON metadata object back to the harness ``dict[str, str]`` shape."""
-    return {str(key): str(value) for key, value in payload.items()}
+_METADATA_ADAPTER: TypeAdapter[dict[str, str]] = TypeAdapter(dict[str, str])
+_ENUM_ADAPTERS: dict[str, TypeAdapter[str]] = {}
+
+
+def _validate_enum(sp: ModuleType, name: str, value: str) -> str:
+    """Validate a stored string against a harness ``Literal`` type (e.g. ``EventKind``).
+
+    Mirrors the reference stores' loud read path: an unknown stored value raises
+    ``pydantic.ValidationError`` (a ``ValueError`` subclass) instead of leaking through.
+    """
+    adapter = _ENUM_ADAPTERS.get(name)
+    if adapter is None:
+        adapter = cast('TypeAdapter[str]', TypeAdapter(getattr(sp, name)))
+        _ENUM_ADAPTERS[name] = adapter
+    return adapter.validate_python(value)
 
 
 def _run_record(sp: ModuleType, row: StepRun) -> RunRecord:
@@ -62,7 +75,7 @@ def _run_record(sp: ModuleType, row: StepRun) -> RunRecord:
         conversation_id=row.conversation_id,
         parent_run_id=row.parent_run_id,
         agent_name=row.agent_name,
-        metadata=_str_metadata(row.run_metadata),
+        metadata=_METADATA_ADAPTER.validate_python(row.run_metadata),
         started_at=row.started_at,
     )
 
@@ -70,7 +83,7 @@ def _run_record(sp: ModuleType, row: StepRun) -> RunRecord:
 def _event_record(sp: ModuleType, row: StepEvent) -> HarnessStepEvent:
     return sp.StepEvent(
         run_id=row.run_id,
-        kind=row.kind,
+        kind=_validate_enum(sp, 'EventKind', row.kind),
         step_index=row.step_index,
         timestamp=row.timestamp,
         conversation_id=row.conversation_id,
@@ -79,7 +92,7 @@ def _event_record(sp: ModuleType, row: StepEvent) -> HarnessStepEvent:
         tool_call_id=row.tool_call_id,
         tool_name=row.tool_name,
         error=row.error,
-        metadata=_str_metadata(row.event_metadata),
+        metadata=_METADATA_ADAPTER.validate_python(row.event_metadata),
     )
 
 
@@ -92,7 +105,7 @@ def _snapshot_record(sp: ModuleType, row: StepSnapshot) -> ContinuableSnapshot:
         parent_run_id=row.parent_run_id,
         agent_name=row.agent_name,
         timestamp=row.timestamp,
-        state=row.state,
+        state=_validate_enum(sp, 'SnapshotState', row.state),
     )
 
 
@@ -101,7 +114,7 @@ def _tool_effect_record(sp: ModuleType, row: StepToolEffect) -> ToolEffectRecord
         tool_call_id=row.tool_call_id,
         tool_name=row.tool_name,
         run_id=row.run_id,
-        status=row.status,
+        status=_validate_enum(sp, 'ToolEffectStatus', row.status),
         started_at=row.started_at,
         ended_at=row.ended_at,
         idempotency_key=row.idempotency_key,
@@ -210,6 +223,21 @@ class SQLAlchemyStepStore:
         async with self._sessions.scope() as (db, _owned):
             row = (await db.scalars(statement.limit(1))).first()
             return None if row is None else _snapshot_record(sp, row)
+
+    async def list_snapshots(self, *, run_id: str, include_interrupted: bool = False) -> list[ContinuableSnapshot]:
+        """Return every snapshot for the run in ``seq`` (capture) order.
+
+        Additive beyond the harness ``StepStore`` protocol: the conversation-search
+        ``SnapshotStore`` surface expects it. Skips states other than ``complete``
+        unless ``include_interrupted`` is set, matching ``latest_snapshot``.
+        """
+        sp = _harness()
+        statement = sa.select(StepSnapshot).where(StepSnapshot.run_id == run_id).order_by(StepSnapshot.seq.asc())
+        if not include_interrupted:
+            statement = statement.where(StepSnapshot.state == 'complete')
+        async with self._sessions.scope() as (db, _owned):
+            rows = (await db.scalars(statement)).all()
+            return [_snapshot_record(sp, row) for row in rows]
 
     async def record_tool_effect(self, record: ToolEffectRecord) -> None:
         _harness()
